@@ -100,6 +100,7 @@ function loadTurnEnv() {
 loadTurnEnv();
 
 const PORT = parseInt(process.env.PORT, 10) || 8085;
+const HOST = (process.env.HOST || '0.0.0.0').trim();
 // App-level liveness (JSON heartbeat from clients). Loose timeouts: proxies and OS sleep cause jitter.
 const HEARTBEAT_CHECK_MS = parseInt(process.env.HEARTBEAT_CHECK_INTERVAL_MS, 10) || 8000;
 const HEARTBEAT_TIMEOUT = parseInt(process.env.CLIENT_HEARTBEAT_TIMEOUT_MS, 10) || 90000;
@@ -644,14 +645,14 @@ class SignalingServer {
       })();
     });
 
-    this.httpServer.listen(PORT, () => {
-      console.log(`✅ Signaling server (HTTP + WebSocket) on port ${PORT}`);
+    this.httpServer.listen(PORT, HOST, () => {
+      console.log(`✅ Signaling server (HTTP + WebSocket) on ${HOST}:${PORT}`);
     });
     this.httpServer.on('error', (err) => {
       if (err?.code === 'EADDRINUSE') {
-        console.error('[signaling] Port 8085 already in use. Kill existing process:');
-        console.error('  Windows: netstat -ano | findstr :8085  then  taskkill /PID <pid> /F');
-        console.error('  Mac/Linux: lsof -ti:8085 | xargs kill -9');
+        console.error(`[signaling] ${HOST}:${PORT} already in use. Kill existing process:`);
+        console.error(`  Windows: netstat -ano | findstr :${PORT}  then  taskkill /PID <pid> /F`);
+        console.error(`  Mac/Linux: lsof -ti:${PORT} | xargs kill -9`);
         process.exit(1);
       }
       console.error('❌ HTTP server error:', err?.message || err);
