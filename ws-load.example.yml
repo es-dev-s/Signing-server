@@ -1,0 +1,24 @@
+config:
+  target: "wss://YOUR_SIGNALLING_HOST"
+  phases:
+    - duration: 60
+      arrivalRate: 10
+      name: warm
+    - duration: 120
+      arrivalRate: 30
+      name: ramp
+    - duration: 180
+      arrivalRate: 50
+      name: soak
+  ws:
+    perMessageDeflate: false
+scenarios:
+  - name: basic heartbeat
+    engine: ws
+    flow:
+      - send: '{ "type": "public-list-orgs" }'
+      - think: 1
+      - loop:
+          - send: '{ "type": "heartbeat" }'
+          - think: 3
+        count: 40

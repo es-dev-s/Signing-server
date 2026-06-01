@@ -1,0 +1,25 @@
+{
+  "name": "anywhere-signaling-server",
+  "version": "1.0.0",
+  "description": "WebSocket signaling server for AnyWhere screen sharing",
+  "main": "server.js",
+  "scripts": {
+    "prestart": "node scripts/validate-env.js",
+    "start": "node server.js",
+    "dev": "node server.js",
+    "reset-db": "node scripts/reset-db.js",
+    "start:fresh": "node -e \"process.env.SIGNALING_WIPE_DB='1'; require('./server.js');\"",
+    "lint": "node --check server.js database.js auditOrgAccessProxy.js scripts/reset-db.js scripts/verify-audit-proxy.js",
+    "typecheck": "node --check server.js database.js auditOrgAccessProxy.js",
+    "test": "npm run lint && npm run typecheck",
+    "verify:audit-proxy": "node scripts/verify-audit-proxy.js",
+    "db:check": "node scripts/db-check.js",
+    "db:migrate": "node scripts/apply-supabase-migration.js",
+    "mint:token": "node scripts/mint-ingest-token.js --clientId=1 --orgId=1"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "pg": "^8.16.3",
+    "ws": "^8.16.0"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+signaling.db
+signaling.db-shm
+signaling.db-wal
+*.log
+.env
+.env.turn
+.env.trun
+.env.turn.example

@@ -1,0 +1,7 @@
+node_modules
+signaling.db
+signaling.db-shm
+signaling.db-wal
+.git
+*.log
+.env
