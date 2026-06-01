@@ -656,28 +656,32 @@ class SignalingServer {
         console.error(`❌ WebSocket error for ${socketId}:`, err.message);
       });
 
-      // Send welcome with socket ID + WebRTC ICE config (Cloudflare API and/or home coturn).
+      // Send welcome with socket ID + WebRTC ICE config.
+      // Google STUN is always prepended so LAN / direct connections work even if TURN relay fails.
       void (async () => {
+        const googleStun = [{ urls: 'stun:stun.l.google.com:19302' }];
         try {
           const cloudflareIceServers = await fetchCloudflareIceServers();
           const cfPrimary = isCloudflareTurnPrimary() && hasCloudflareTurnKeys();
           if (cfPrimary && cloudflareIceServers.length > 0) {
-            this._send(ws, { type: 'welcome', socketId: socketId, iceServers: cloudflareIceServers });
+            // Cloudflare primary + working: prepend Google STUN so direct/LAN still succeeds if TURN fails.
+            this._send(ws, { type: 'welcome', socketId: socketId, iceServers: [...googleStun, ...cloudflareIceServers] });
             return;
           }
           const { username, credential } = mintTurnCredentials(86400);
           const homeIceServers = buildIceServers(username, credential, false);
           if (cfPrimary && cloudflareIceServers.length === 0) {
-            console.warn('[welcome] Cloudflare TURN primary but API returned no iceServers; falling back to home TURN');
+            console.warn('[welcome] Cloudflare TURN primary but API returned no iceServers — using Google STUN + home TURN fallback');
           }
-          const iceServersForPeer =
-            cloudflareIceServers.length > 0 ? [...homeIceServers, ...cloudflareIceServers] : homeIceServers;
-          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: iceServersForPeer });
+          const relayServers = cloudflareIceServers.length > 0
+            ? [...homeIceServers, ...cloudflareIceServers]
+            : homeIceServers;
+          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: [...googleStun, ...relayServers] });
         } catch (err) {
-          console.warn('[welcome] ICE merge failed, sending home-only:', err?.message || err);
+          console.warn('[welcome] ICE merge failed, falling back to Google STUN + home TURN:', err?.message || err);
           const { username, credential } = mintTurnCredentials(86400);
           const homeIceServers = buildIceServers(username, credential, false);
-          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: homeIceServers });
+          this._send(ws, { type: 'welcome', socketId: socketId, iceServers: [...googleStun, ...homeIceServers] });
         }
       })();
     });
@@ -3582,7 +3586,10 @@ class SignalingServer {
     if (!socketId) return null;
 
     const clientConn = this.clients.get(socketId);
-    if (!clientConn || clientConn.kind !== 'client' || !isOpen(clientConn.ws)) return null;
+    if (!clientConn || !isOpen(clientConn.ws)) return null;
+    // Allow mid-auth sockets (kind=null with pendingDeviceId set) — they are authenticating as client.
+    // Reject only if kind is explicitly set to something other than 'client'.
+    if (clientConn.kind !== null && clientConn.kind !== 'client') return null;
 
     if (client.socket_id !== socketId) {
       try {
