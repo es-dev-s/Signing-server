@@ -147,6 +147,17 @@ const ENABLE_APP_ACTIVITY_TELEMETRY =
     ? false
     : true;
 console.log(`[Telemetry] ENABLE_APP_ACTIVITY_TELEMETRY=${ENABLE_APP_ACTIVITY_TELEMETRY} (browser tabs + taskbar ingest/broadcast)`);
+const _taskbarTelRaw = String(
+  process.env.ENABLE_TASKBAR_TELEMETRY ?? (ENABLE_APP_ACTIVITY_TELEMETRY ? 'true' : 'false')
+).trim().toLowerCase();
+const ENABLE_TASKBAR_TELEMETRY =
+  _taskbarTelRaw === '0' || _taskbarTelRaw === 'false' || _taskbarTelRaw === 'off' || _taskbarTelRaw === 'no'
+    ? false
+    : true;
+console.log(`[Telemetry] ENABLE_TASKBAR_TELEMETRY=${ENABLE_TASKBAR_TELEMETRY} (taskbar ingest + admin broadcast)`);
+const _taskbarLogRaw = String(process.env.ENABLE_TASKBAR_INGEST_LOGS ?? '').trim().toLowerCase();
+const ENABLE_TASKBAR_INGEST_LOGS =
+  _taskbarLogRaw === '1' || _taskbarLogRaw === 'true' || _taskbarLogRaw === 'on' || _taskbarLogRaw === 'yes';
 // Real-time fast lane: when false, browser-tab ingest still broadcasts to admins but skips DB writes.
 const _tabPersistRaw = String(process.env.BROWSER_TAB_PERSIST_TO_DB ?? '1').trim().toLowerCase();
 const BROWSER_TAB_PERSIST_TO_DB =
@@ -942,7 +953,7 @@ class SignalingServer {
   }
 
   async _httpPostTaskbarEvents(req, res) {
-    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY || !ENABLE_TASKBAR_TELEMETRY) {
       // Drain request body for keep-alive correctness, then no-op.
       try { await this._readHttpBody(req); } catch {}
       this._httpJson(res, 200, { ok: true, accepted: 0, disabled: true });
@@ -1064,14 +1075,16 @@ class SignalingServer {
 
     const accepted = await this.db.insertTaskbarEvents(rows);
     const latestOpenApps = rows.length > 0 ? JSON.parse(rows[rows.length - 1].openAppsJson) : [];
-    console.log(`[Received from Client ---] Taskbar events: ${accepted} event(s) ingested for clientId=${clientId} | openApps=${latestOpenApps.length}`);
+    if (ENABLE_TASKBAR_INGEST_LOGS) {
+      console.log(`[Received from Client ---] Taskbar events: ${accepted} event(s) ingested for clientId=${clientId} | openApps=${latestOpenApps.length}`);
+    }
     // Pass the latest openApps snapshot to broadcast so admins get live data inline (no HTTP roundtrip needed).
     this._broadcastTaskbarEventsToAdmins(clientId, accepted, latestOpenApps);
     this._httpJson(res, 200, { ok: true, accepted });
   }
 
   async _httpGetTaskbarEvents(req, res) {
-    if (!ENABLE_APP_ACTIVITY_TELEMETRY) {
+    if (!ENABLE_APP_ACTIVITY_TELEMETRY || !ENABLE_TASKBAR_TELEMETRY) {
       this._httpJson(res, 200, { success: true, events: [], page: 1, limit: 0, hasMore: false, disabled: true });
       return;
     }
