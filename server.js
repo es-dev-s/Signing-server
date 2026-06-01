@@ -1905,6 +1905,27 @@ class SignalingServer {
 
     const prevSocketId = await this.db.getSocketIdForDevice(deviceId);
 
+    // Bind socket to known client immediately so admin connect works during re-auth (before upsert returns).
+    const connEarly = this.clients.get(socketId);
+    if (connEarly) {
+      connEarly.pendingDeviceId = deviceId;
+      try {
+        const known = await this.db.getClientRowByDeviceId(deviceId);
+        if (known?.id) {
+          connEarly.kind = 'client';
+          connEarly.client = {
+            id: Number(known.id),
+            orgId: Number(known.org_id),
+            fullName: known.full_name,
+            deviceId,
+          };
+          connEarly.admin = null;
+        }
+      } catch (e) {
+        console.warn('[ClientAuth] early bind failed:', e?.message || e);
+      }
+    }
+
     // If a device is already connected, avoid rapid "takeover fights" that cause storms.
     if (prevSocketId && prevSocketId !== socketId) {
       const oldConn = this.clients.get(prevSocketId);
@@ -2460,7 +2481,7 @@ class SignalingServer {
       client = row && !row.disabled ? row : null;
     }
 
-    if (!client || client.status === 'offline' || !client.socket_id) {
+    if (!client) {
       this._send(ws, { type: 'connect-response', success: false, error: 'CLIENT_UNAVAILABLE', message: 'Client unavailable' });
       return;
     }
@@ -2476,17 +2497,25 @@ class SignalingServer {
       return;
     }
 
-    // Stream policy gates disabled: allow any authenticated admin to connect to any online client.
-
-    const clientConn = this.clients.get(client.socket_id);
-    if (!clientConn || clientConn.kind !== 'client' || !isOpen(clientConn.ws)) {
-      this._send(ws, { type: 'connect-response', success: false, error: 'CLIENT_UNAVAILABLE', message: 'Client connection not found' });
+    const live = await this._resolveLiveClientConnection(client.id);
+    if (!live) {
+      this._send(ws, {
+        type: 'connect-response',
+        success: false,
+        error: 'CLIENT_UNAVAILABLE',
+        message:
+          client.status === 'offline' || !client.socket_id
+            ? 'Client unavailable'
+            : 'Client connection not found — client may have reconnected; try again',
+      });
       return;
     }
 
-    const sessionId = await this.db.createSession(client.org_id, client.id, admin.admin_id);
+    const { client: clientRow, clientConn, socketId: clientSocketId } = live;
+
+    const sessionId = await this.db.createSession(clientRow.org_id, clientRow.id, admin.admin_id);
     if (!this.adminViewerLinks.has(socketId)) this.adminViewerLinks.set(socketId, new Set());
-    this.adminViewerLinks.get(socketId).add(client.socket_id);
+    this.adminViewerLinks.get(socketId).add(clientSocketId);
     this._send(clientConn.ws, {
       type: 'prepare-peer',
       agentName: admin.full_name,
@@ -2497,18 +2526,18 @@ class SignalingServer {
       type: 'start-offer',
       success: true,
       sessionId,
-      clientId: client.id,
-      clientFullName: client.full_name,
-      clientSocketId: client.socket_id,
+      clientId: clientRow.id,
+      clientFullName: clientRow.full_name,
+      clientSocketId,
     });
     this._send(ws, {
       type: 'connect-response',
       success: true,
-      message: `Connecting to "${client.full_name}"...`,
+      message: `Connecting to "${clientRow.full_name}"...`,
       sessionId,
-      clientId: client.id,
-      clientFullName: client.full_name,
-      clientSocketId: client.socket_id,
+      clientId: clientRow.id,
+      clientFullName: clientRow.full_name,
+      clientSocketId,
     });
   }
 
@@ -2956,10 +2985,11 @@ class SignalingServer {
 
   _mapAdminClientRow(c) {
     const id = c.id;
+    const status = this._effectiveClientStatus(c);
     return {
       id,
       fullName: c.full_name || c.fullName,
-      status: c.status || 'offline',
+      status,
       orgId: c.org_id != null ? c.org_id : c.orgId,
       orgName: c.org_name != null ? c.org_name : (c.orgName != null ? c.orgName : null),
       claimedOrgName: c.claimed_org_name != null ? c.claimed_org_name : (c.claimedOrgName != null ? c.claimedOrgName : null),
@@ -3494,10 +3524,76 @@ class SignalingServer {
   }
 
   _findClientConnectionByClientId(clientId) {
+    const cid = Number(clientId);
+    if (!Number.isFinite(cid) || cid <= 0) return null;
     for (const [, conn] of this.clients) {
-      if (conn.kind === 'client' && conn.client?.id === clientId) return conn;
+      if (conn.kind === 'client' && Number(conn.client?.id) === cid && isOpen(conn.ws)) return conn;
     }
     return null;
+  }
+
+  _findClientSocketIdByClientId(clientId) {
+    const cid = Number(clientId);
+    if (!Number.isFinite(cid) || cid <= 0) return null;
+    for (const [socketId, conn] of this.clients) {
+      if (!isOpen(conn.ws)) continue;
+      if (conn.kind === 'client' && Number(conn.client?.id) === cid) return socketId;
+    }
+    return null;
+  }
+
+  /** Roster status: offline when DB says online but no live WebSocket (stale after server restart). */
+  _effectiveClientStatus(dbRow) {
+    const cid = Number(dbRow?.id);
+    if (!Number.isFinite(cid) || cid <= 0) return 'offline';
+    const live = this._findClientSocketIdByClientId(cid);
+    if (!live) return 'offline';
+    const st = String(dbRow.status || 'offline');
+    return st === 'sharing' ? 'sharing' : 'online';
+  }
+
+  /**
+   * Resolve live client WebSocket when DB socket_id is stale (client reconnected).
+   * @returns {{ client: object, clientConn: object, socketId: string } | null}
+   */
+  async _resolveLiveClientConnection(clientId) {
+    const cid = Number(clientId);
+    if (!Number.isFinite(cid) || cid <= 0) return null;
+    const client = await this.db.getClientById(cid);
+    if (!client || Number(client.disabled) === 1) return null;
+
+    let socketId = this._findClientSocketIdByClientId(cid);
+    if (!socketId && client.socket_id) {
+      const byDb = this.clients.get(client.socket_id);
+      if (byDb && isOpen(byDb.ws)) {
+        const boundId = byDb.kind === 'client' ? Number(byDb.client?.id) : null;
+        if (boundId === cid || boundId == null) socketId = client.socket_id;
+      }
+    }
+    if (!socketId && client.device_id) {
+      for (const [sid, conn] of this.clients) {
+        if (!isOpen(conn.ws)) continue;
+        if (conn.pendingDeviceId === client.device_id || conn.client?.deviceId === client.device_id) {
+          socketId = sid;
+          break;
+        }
+      }
+    }
+    if (!socketId) return null;
+
+    const clientConn = this.clients.get(socketId);
+    if (!clientConn || clientConn.kind !== 'client' || !isOpen(clientConn.ws)) return null;
+
+    if (client.socket_id !== socketId) {
+      try {
+        await this.db.syncClientSocketId(cid, socketId);
+        client.socket_id = socketId;
+      } catch (e) {
+        console.warn('[connect] syncClientSocketId failed:', e?.message || e);
+      }
+    }
+
+    return { client, clientConn, socketId };
   }
 
   _findConnectionByName(name) {

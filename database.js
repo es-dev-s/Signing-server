@@ -772,19 +772,38 @@ class SignalingDatabase {
   async getClientById(clientId) {
     if (!Number.isFinite(clientId)) return null;
     const r = await this._q(
-      'SELECT id, org_id, full_name, status, socket_id, disabled FROM clients WHERE id = $1',
+      'SELECT id, org_id, full_name, status, socket_id, disabled, device_id FROM clients WHERE id = $1',
       [clientId]
     );
     return r.rows[0] || null;
   }
 
+  /** Heal DB row when the client reconnected with a new WebSocket id. */
+  async syncClientSocketId(clientId, socketId) {
+    if (!Number.isFinite(clientId) || typeof socketId !== 'string' || !socketId.trim()) return;
+    const t = nowMs();
+    await this._q(
+      `UPDATE clients SET socket_id = $1, status = $2, last_heartbeat = $3, last_online_at = COALESCE(last_online_at, $3)
+       WHERE id = $4`,
+      [socketId.trim(), 'online', t, clientId],
+    );
+  }
+
   /** Resolve numeric client id from stable device UUID (client REST ingest auth). */
   async getClientIdByDeviceId(deviceId) {
+    const row = await this.getClientRowByDeviceId(deviceId);
+    return row?.id ?? null;
+  }
+
+  async getClientRowByDeviceId(deviceId) {
     if (typeof deviceId !== 'string' || deviceId.trim().length < 8) return null;
-    const r = await this._q('SELECT id, disabled FROM clients WHERE device_id = $1', [deviceId.trim()]);
+    const r = await this._q(
+      'SELECT id, org_id, full_name, status, socket_id, disabled, device_id FROM clients WHERE device_id = $1',
+      [deviceId.trim()],
+    );
     const row = r.rows[0];
     if (!row || Number(row.disabled) === 1) return null;
-    return row.id;
+    return row;
   }
 
   /**
