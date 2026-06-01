@@ -214,6 +214,15 @@ function filterPort53FromCloudflareIceServers(entries) {
   return out;
 }
 
+function isCloudflareTurnPrimary() {
+  const src = String(process.env.ICE_TURN_SOURCE || '').trim().toLowerCase();
+  return src === 'cloudflare' || src === 'cf';
+}
+
+function hasCloudflareTurnKeys() {
+  return !!(process.env.CLOUDFLARE_TURN_KEY_ID || '').trim() && !!(process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '').trim();
+}
+
 /**
  * Fetches short-lived Cloudflare TURN/STUN iceServers via API. Returns [] if unset, failed, or misconfigured.
  */
@@ -317,19 +326,24 @@ function buildIceServers(turnUsername = process.env.TURN_USERNAME, turnCredentia
   }
 
   if (logConfig) {
-    console.log('✅ ICE config loaded (default path — home first, no public Google STUN):');
-    console.log('   STUN (home):', turnStunUrl || '(missing)');
-    console.log('   TURN UDP:', turnUdpUrl || '(missing)');
-    console.log('   TURN TCP:', turnTcpUrl || '(missing)');
-    console.log('   TURNS TCP:', turnTlsTcpUrl || '(missing)');
-    console.log('   TURN username present:', !!turnUsername);
-    console.log('   TURN credential present:', !!turnCredential);
-    console.log(
-      '   Cloudflare API (per connection):',
-      (process.env.CLOUDFLARE_TURN_KEY_ID || '').trim() && (process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '').trim()
-        ? 'enabled when keys set'
-        : '(not configured)',
-    );
+    const cfPrimary = isCloudflareTurnPrimary() && hasCloudflareTurnKeys();
+    if (cfPrimary) {
+      console.log('✅ ICE config: Cloudflare Realtime TURN (ICE_TURN_SOURCE=cloudflare)');
+      console.log('   Turn Token ID:', (process.env.CLOUDFLARE_TURN_KEY_ID || '').trim().slice(0, 8) + '…');
+      console.log('   Home coturn:', turnStunUrl ? 'configured (fallback only)' : '(not configured)');
+    } else {
+      console.log('✅ ICE config loaded (home coturn + optional Cloudflare API merge):');
+      console.log('   STUN (home):', turnStunUrl || '(missing)');
+      console.log('   TURN UDP:', turnUdpUrl || '(missing)');
+      console.log('   TURN TCP:', turnTcpUrl || '(missing)');
+      console.log('   TURNS TCP:', turnTlsTcpUrl || '(missing)');
+      console.log('   TURN username present:', !!turnUsername);
+      console.log('   TURN credential present:', !!turnCredential);
+      console.log(
+        '   Cloudflare API (per connection):',
+        hasCloudflareTurnKeys() ? 'enabled when keys set' : '(not configured)',
+      );
+    }
   }
 
   return iceServers;
@@ -354,10 +368,11 @@ const ICE_SERVERS = buildIceServers();
 if (process.env.NODE_ENV !== 'production') {
   void (async () => {
     const cf = await fetchCloudflareIceServers();
-    const merged = [...ICE_SERVERS, ...cf];
+    const preview =
+      isCloudflareTurnPrimary() && hasCloudflareTurnKeys() && cf.length > 0 ? cf : [...ICE_SERVERS, ...cf];
     console.log(
-      '[ICE][dev] merged iceServers preview (home → Cloudflare, credentials redacted):',
-      merged.map((entry) => ({
+      `[ICE][dev] iceServers preview (${isCloudflareTurnPrimary() ? 'Cloudflare primary' : 'home + Cloudflare'}, credentials redacted):`,
+      preview.map((entry) => ({
         urls: entry.urls,
         username: entry.username ? '(set)' : undefined,
         credential: entry.credential ? '(set)' : undefined,
@@ -370,8 +385,10 @@ const hasTurn = ICE_SERVERS.some((s) =>
   (Array.isArray(s.urls) ? s.urls : [s.urls])
     .some((u) => String(u).startsWith('turn:') || String(u).startsWith('turns:'))
 );
-if (isProduction && !hasTurn) {
-  console.error('FATAL: Production mode requires TURN server. Set TURN env vars (Railway) or .env.turn/.env.trun credentials.');
+if (isProduction && !hasTurn && !(isCloudflareTurnPrimary() && hasCloudflareTurnKeys())) {
+  console.error(
+    'FATAL: Production mode requires TURN. Set ICE_TURN_SOURCE=cloudflare + CLOUDFLARE_TURN_* or home TURN_* env vars.',
+  );
   process.exit(1);
 }
 
@@ -639,13 +656,22 @@ class SignalingServer {
         console.error(`❌ WebSocket error for ${socketId}:`, err.message);
       });
 
-      // Send welcome with socket ID + WebRTC ICE config (home lab + optional Cloudflare API iceServers).
+      // Send welcome with socket ID + WebRTC ICE config (Cloudflare API and/or home coturn).
       void (async () => {
         try {
+          const cloudflareIceServers = await fetchCloudflareIceServers();
+          const cfPrimary = isCloudflareTurnPrimary() && hasCloudflareTurnKeys();
+          if (cfPrimary && cloudflareIceServers.length > 0) {
+            this._send(ws, { type: 'welcome', socketId: socketId, iceServers: cloudflareIceServers });
+            return;
+          }
           const { username, credential } = mintTurnCredentials(86400);
           const homeIceServers = buildIceServers(username, credential, false);
-          const cloudflareIceServers = await fetchCloudflareIceServers();
-          const iceServersForPeer = [...homeIceServers, ...cloudflareIceServers];
+          if (cfPrimary && cloudflareIceServers.length === 0) {
+            console.warn('[welcome] Cloudflare TURN primary but API returned no iceServers; falling back to home TURN');
+          }
+          const iceServersForPeer =
+            cloudflareIceServers.length > 0 ? [...homeIceServers, ...cloudflareIceServers] : homeIceServers;
           this._send(ws, { type: 'welcome', socketId: socketId, iceServers: iceServersForPeer });
         } catch (err) {
           console.warn('[welcome] ICE merge failed, sending home-only:', err?.message || err);
@@ -2439,6 +2465,17 @@ class SignalingServer {
       return;
     }
 
+    // Production isolation: org_admin / it_ops may only view clients in their own organization.
+    if (admin.role !== 'super_admin' && Number(client.org_id) !== Number(admin.org_id)) {
+      this._send(ws, {
+        type: 'connect-response',
+        success: false,
+        error: 'FORBIDDEN',
+        message: 'Client is not in your organization',
+      });
+      return;
+    }
+
     // Stream policy gates disabled: allow any authenticated admin to connect to any online client.
 
     const clientConn = this.clients.get(client.socket_id);
@@ -2532,6 +2569,16 @@ class SignalingServer {
         success: false,
         error: 'CLIENT_UNAVAILABLE',
         message: 'Client unavailable',
+      });
+      return;
+    }
+
+    if (admin.role !== 'super_admin' && Number(client.org_id) !== Number(admin.org_id)) {
+      this._send(ws, {
+        type: 'admin-focus-client-app-response',
+        success: false,
+        error: 'FORBIDDEN',
+        message: 'Client is not in your organization',
       });
       return;
     }

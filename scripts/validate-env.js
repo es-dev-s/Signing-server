@@ -4,15 +4,18 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 require('dotenv').config({ path: path.join(__dirname, '..', '.env.local') });
 
-const required = [
-  'TURN_STUN_URL',
-  'TURN_UDP_URL',
-  'TURN_TCP_URL',
-  'TURN_USERNAME',
-  'TURN_CREDENTIAL',
-  'WS_CONNECT_TOKEN',
-  'INGEST_TOKEN_SECRET',
-];
+const turnSource = String(process.env.ICE_TURN_SOURCE || '').trim().toLowerCase();
+const cloudflareTurn =
+  (turnSource === 'cloudflare' || turnSource === 'cf') &&
+  !!(process.env.CLOUDFLARE_TURN_KEY_ID || '').trim() &&
+  !!(process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '').trim();
+
+const required = ['WS_CONNECT_TOKEN', 'INGEST_TOKEN_SECRET'];
+if (!cloudflareTurn) {
+  required.push('TURN_STUN_URL', 'TURN_UDP_URL', 'TURN_TCP_URL', 'TURN_USERNAME', 'TURN_CREDENTIAL');
+} else {
+  required.push('CLOUDFLARE_TURN_KEY_ID', 'CLOUDFLARE_TURN_KEY_API_TOKEN');
+}
 
 const missing = required.filter((k) => !process.env[k]);
 const hasDbUrl = !!process.env.SUPABASE_DATABASE_URL || !!process.env.DATABASE_URL;
