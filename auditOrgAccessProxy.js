@@ -203,4 +203,64 @@ async function handleReview(signaling, socketId, ws, msg) {
   }
 }
 
-module.exports = { handleList, handleReview };
+// ─── Audit Groups proxy ───────────────────────────────────────────────────────
+
+async function handleGroupsGet(signaling, socketId, ws, msg) {
+  const ipcCorrId = typeof msg.ipcCorrId === 'string' ? msg.ipcCorrId : undefined;
+  const admin = await signaling._requireAdmin(socketId, ws, msg);
+  if (!admin) return;
+  if (admin.role !== 'super_admin') {
+    signaling._send(ws, { type: 'admin-audit-groups-get-response', success: false, error: 'FORBIDDEN', ipcCorrId });
+    return;
+  }
+  const { origin, secret, configured } = auditEnv();
+  if (!configured) {
+    signaling._send(ws, { type: 'admin-audit-groups-get-response', success: false, error: 'AUDIT_PROXY_NOT_CONFIGURED', ipcCorrId });
+    return;
+  }
+  try {
+    const { ok, status, data } = await auditFetchJson(origin, secret, '/api/superadmin/audit-groups');
+    if (!ok) {
+      signaling._send(ws, { type: 'admin-audit-groups-get-response', success: false, error: data.error || `HTTP ${status}`, ipcCorrId });
+      return;
+    }
+    signaling._send(ws, { type: 'admin-audit-groups-get-response', success: true, groups: data.groups ?? [], teamLeads: data.teamLeads ?? [], ipcCorrId });
+  } catch (err) {
+    signaling._send(ws, { type: 'admin-audit-groups-get-response', success: false, error: formatNetworkError(err), ipcCorrId });
+  }
+}
+
+async function handleGroupsMutate(signaling, socketId, ws, msg) {
+  const ipcCorrId = typeof msg.ipcCorrId === 'string' ? msg.ipcCorrId : undefined;
+  const admin = await signaling._requireAdmin(socketId, ws, msg);
+  if (!admin) return;
+  if (admin.role !== 'super_admin') {
+    signaling._send(ws, { type: 'admin-audit-groups-mutate-response', success: false, error: 'FORBIDDEN', ipcCorrId });
+    return;
+  }
+  const { origin, secret, configured } = auditEnv();
+  if (!configured) {
+    signaling._send(ws, { type: 'admin-audit-groups-mutate-response', success: false, error: 'AUDIT_PROXY_NOT_CONFIGURED', ipcCorrId });
+    return;
+  }
+  const body = { ...msg };
+  delete body.type;
+  delete body.token;
+  delete body.ipcCorrId;
+  try {
+    const { ok, status, data } = await auditFetchJson(origin, secret, '/api/superadmin/audit-groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!ok) {
+      signaling._send(ws, { type: 'admin-audit-groups-mutate-response', success: false, error: data.error || `HTTP ${status}`, message: data.message, ipcCorrId });
+      return;
+    }
+    signaling._send(ws, { type: 'admin-audit-groups-mutate-response', success: true, ...data, ipcCorrId });
+  } catch (err) {
+    signaling._send(ws, { type: 'admin-audit-groups-mutate-response', success: false, error: formatNetworkError(err), ipcCorrId });
+  }
+}
+
+module.exports = { handleList, handleReview, handleGroupsGet, handleGroupsMutate };

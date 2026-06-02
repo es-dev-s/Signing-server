@@ -586,16 +586,12 @@ class SignalingDatabase {
     const applyOrgId = existing?.pending_org_id ? existing.pending_org_id : org.id;
     const pendingOrgId = existing?.pending_org_id ? null : null;
 
+    // What the member typed at install / enroll (shown in audit next to their name).
     let claimedOrgName = null;
     if (existing?.pending_org_id) {
       claimedOrgName = null;
-    } else if (usedDefaultFallback) {
-      claimedOrgName = requestedRaw || null;
-    } else {
-      const reqNorm = normalizeOrgName(orgName);
-      if (org.name === 'default' && reqNorm && reqNorm !== 'default') {
-        claimedOrgName = requestedRaw || null;
-      }
+    } else if (requestedRaw) {
+      claimedOrgName = requestedRaw;
     }
 
     const prevOrgIdForBroadcast =

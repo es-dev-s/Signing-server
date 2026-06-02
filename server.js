@@ -173,6 +173,28 @@ const MAX_HTTP_BODY_BYTES = 256 * 1024;
 // This guard prefers the currently-online socket and rejects fast successive takeovers.
 const DEVICE_TAKEOVER_COOLDOWN_MS = parseInt(process.env.DEVICE_TAKEOVER_COOLDOWN_MS, 10) || 3000;
 
+/** Max distinct clients one admin/audit socket may view at once (grid / multi-monitor). */
+const MAX_ADMIN_VIEWER_TARGETS = parseInt(process.env.MAX_ADMIN_VIEWER_TARGETS, 10) || 24;
+/** Max admins/audit users viewing the same client desktop simultaneously. */
+const MAX_VIEWERS_PER_CLIENT = parseInt(process.env.MAX_VIEWERS_PER_CLIENT, 10) || 5;
+/** Per-socket WS rate limit (non-WebRTC control messages). */
+const SIGNALING_RATE_CAPACITY = parseInt(process.env.SIGNALING_RATE_CAPACITY, 10) || 200;
+const SIGNALING_RATE_REFILL_PER_SEC = parseInt(process.env.SIGNALING_RATE_REFILL_PER_SEC, 10) || 80;
+/** WebRTC signaling is bursty (many ICE candidates); never rate-limit these types. */
+const WEBRTC_RELAY_TYPES = new Set([
+  'offer',
+  'answer',
+  'ice-candidate',
+  'client-ready',
+  'request-offer',
+  'enable-client-media',
+  'client-screen-sources',
+]);
+console.log(
+  `[Limits] adminViewerTargets=${MAX_ADMIN_VIEWER_TARGETS} viewersPerClient=${MAX_VIEWERS_PER_CLIENT} ` +
+  `rate=${SIGNALING_RATE_CAPACITY}/${SIGNALING_RATE_REFILL_PER_SEC}s`,
+);
+
 function normalizeIceServersFromJson(parsed) {
   if (!Array.isArray(parsed) || parsed.length === 0) return null;
   const out = [];
@@ -522,6 +544,8 @@ class SignalingServer {
     this.latestBrowserTabByClientId = new Map();
     /** adminSocketId -> Set<clientSocketId> — tear down client WebRTC when admin stops or disconnects */
     this.adminViewerLinks = new Map();
+    /** clientSocketId -> Set<adminSocketId> — cap concurrent viewers per member desktop */
+    this.clientViewerLinks = new Map();
     /** client socket metadata (published screen sources) is held on each live connection. */
   }
 
@@ -602,7 +626,7 @@ class SignalingServer {
         kind: null,
         client: null,
         admin: null,
-        bucket: new TokenBucket({ capacity: 60, refillPerSec: 30 }),
+        bucket: new TokenBucket({ capacity: SIGNALING_RATE_CAPACITY, refillPerSec: SIGNALING_RATE_REFILL_PER_SEC }),
         ip,
         ipStatusSent: false,
         workstationIps: [],
@@ -1722,8 +1746,9 @@ class SignalingServer {
     if (!conn) return;
 
     const type = asNonEmptyString(msg?.type, 64);
-    // Heartbeats must never be dropped by rate limiting (keeps client rows accurate).
-    if (type !== 'heartbeat' && !conn.bucket.take(1)) {
+    // Heartbeats + WebRTC relay must never be dropped (ICE bursts exceed generic rate limits).
+    const skipRateLimit = type === 'heartbeat' || WEBRTC_RELAY_TYPES.has(type);
+    if (!skipRateLimit && !conn.bucket.take(1)) {
       this._send(ws, { type: 'error', error: 'RATE_LIMITED', message: 'Too many messages' });
       return;
     }
@@ -1792,6 +1817,12 @@ class SignalingServer {
         return;
       case 'admin-audit-org-access-review':
         await auditOrgAccessProxy.handleReview(this, socketId, ws, msg);
+        return;
+      case 'admin-audit-groups-get':
+        await auditOrgAccessProxy.handleGroupsGet(this, socketId, ws, msg);
+        return;
+      case 'admin-audit-groups-mutate':
+        await auditOrgAccessProxy.handleGroupsMutate(this, socketId, ws, msg);
         return;
 
       // ─── WebRTC relay ───
@@ -1989,6 +2020,29 @@ class SignalingServer {
           /* ignore */
         }
       }
+
+      // Eagerly clean up stale viewer links for the old socket so the
+      // MAX_VIEWERS_PER_CLIENT cap is not artificially hit while TCP waits
+      // for the old socket's close event (up to ~30s with transport ping).
+      // Notify viewer admins so they can reconnect to the new socket.
+      const staleViewers = this.clientViewerLinks.get(prevSocketId);
+      if (staleViewers && staleViewers.size > 0) {
+        console.log(`[auth] Cleaning ${staleViewers.size} stale viewer link(s) for previous socket ${prevSocketId}`);
+        for (const adminSid of [...staleViewers]) {
+          const adminConn = this.clients.get(adminSid);
+          if (adminConn && isOpen(adminConn.ws)) {
+            // Tell the admin viewer their session dropped so they can reconnect.
+            this._send(adminConn.ws, {
+              type: 'agent-disconnected',
+              agentSocketId: prevSocketId,
+              agentName: 'client',
+              reason: 'client-reconnected',
+            });
+          }
+          this._unlinkViewerSession(adminSid, prevSocketId);
+        }
+      }
+      this.clientViewerLinks.delete(prevSocketId);
     }
 
     void this._broadcastClientsListToAdmins(res.client.org_id);
@@ -2456,6 +2510,34 @@ class SignalingServer {
     await this._broadcastAdminUiFeatures();
   }
 
+  _linkViewerSession(adminSocketId, clientSocketId) {
+    if (!this.adminViewerLinks.has(adminSocketId)) this.adminViewerLinks.set(adminSocketId, new Set());
+    this.adminViewerLinks.get(adminSocketId).add(clientSocketId);
+    if (!this.clientViewerLinks.has(clientSocketId)) this.clientViewerLinks.set(clientSocketId, new Set());
+    this.clientViewerLinks.get(clientSocketId).add(adminSocketId);
+  }
+
+  _unlinkViewerSession(adminSocketId, clientSocketId) {
+    const adminSet = this.adminViewerLinks.get(adminSocketId);
+    if (adminSet) {
+      adminSet.delete(clientSocketId);
+      if (adminSet.size === 0) this.adminViewerLinks.delete(adminSocketId);
+    }
+    const clientSet = this.clientViewerLinks.get(clientSocketId);
+    if (clientSet) {
+      clientSet.delete(adminSocketId);
+      if (clientSet.size === 0) this.clientViewerLinks.delete(clientSocketId);
+    }
+  }
+
+  _countAdminViewerTargets(adminSocketId) {
+    return this.adminViewerLinks.get(adminSocketId)?.size ?? 0;
+  }
+
+  _countClientViewers(clientSocketId) {
+    return this.clientViewerLinks.get(clientSocketId)?.size ?? 0;
+  }
+
   async _handleAdminConnectToClient(socketId, ws, msg) {
     const admin = await this._requireAdmin(socketId, ws, msg);
     if (!admin) return;
@@ -2517,9 +2599,32 @@ class SignalingServer {
 
     const { client: clientRow, clientConn, socketId: clientSocketId } = live;
 
+    const alreadyViewing = this.adminViewerLinks.get(socketId)?.has(clientSocketId) ?? false;
+    if (!alreadyViewing) {
+      if (this._countAdminViewerTargets(socketId) >= MAX_ADMIN_VIEWER_TARGETS) {
+        this._send(ws, {
+          type: 'connect-response',
+          success: false,
+          error: 'ADMIN_VIEWER_LIMIT',
+          message: `You are already viewing the maximum of ${MAX_ADMIN_VIEWER_TARGETS} members. Stop another stream first.`,
+          clientId: clientRow.id,
+        });
+        return;
+      }
+      if (this._countClientViewers(clientSocketId) >= MAX_VIEWERS_PER_CLIENT) {
+        this._send(ws, {
+          type: 'connect-response',
+          success: false,
+          error: 'CLIENT_VIEWER_LIMIT',
+          message: `This member already has ${MAX_VIEWERS_PER_CLIENT} active viewers. Try again shortly.`,
+          clientId: clientRow.id,
+        });
+        return;
+      }
+    }
+
     const sessionId = await this.db.createSession(clientRow.org_id, clientRow.id, admin.admin_id);
-    if (!this.adminViewerLinks.has(socketId)) this.adminViewerLinks.set(socketId, new Set());
-    this.adminViewerLinks.get(socketId).add(clientSocketId);
+    this._linkViewerSession(socketId, clientSocketId);
     this._send(clientConn.ws, {
       type: 'prepare-peer',
       agentName: admin.full_name,
@@ -2553,8 +2658,7 @@ class SignalingServer {
       this._send(ws, { type: 'admin-stop-viewing-response', success: false, error: 'INVALID_INPUT', message: 'clientSocketId required' });
       return;
     }
-    const set = this.adminViewerLinks.get(socketId);
-    if (set) set.delete(clientSocketId);
+    this._unlinkViewerSession(socketId, clientSocketId);
     const clientConn = this.clients.get(clientSocketId);
     const adminConn = this.clients.get(socketId);
     const agentName = adminConn?.admin?.fullName || admin.full_name || 'Admin';
@@ -2854,14 +2958,6 @@ class SignalingServer {
         fromSocketId: socketId,
         fromName,
       };
-      console.log(JSON.stringify({
-        t: relayPayload.timestamp,
-        type: relayPayload.type,
-        from: socketId,
-        to: targetSocketId || targetName || null,
-        seq: relayPayload.seq,
-        bytes: JSON.stringify(relayPayload).length,
-      }));
       this._send(target.ws, relayPayload);
     } else {
       const conn = this.clients.get(socketId);
@@ -2898,17 +2994,25 @@ class SignalingServer {
         void this._notifyAdminsOfClientEvent(client.org_id, client.full_name, 'client-disconnected');
         void this._broadcastClientsListToAdmins(client.org_id);
       }
+      const viewers = this.clientViewerLinks.get(socketId);
+      if (viewers && viewers.size > 0) {
+        for (const adminSid of [...viewers]) {
+          this._unlinkViewerSession(adminSid, socketId);
+        }
+      }
+      this.clientViewerLinks.delete(socketId);
     }
 
     if (conn.kind === 'admin') {
       const links = this.adminViewerLinks.get(socketId);
       if (links && links.size > 0) {
         const name = conn.admin?.fullName || 'Admin';
-        for (const cid of links) {
+        for (const cid of [...links]) {
           const cc = this.clients.get(cid);
           if (cc && cc.kind === 'client' && isOpen(cc.ws)) {
             this._send(cc.ws, { type: 'agent-disconnected', agentSocketId: socketId, agentName: name });
           }
+          this._unlinkViewerSession(socketId, cid);
         }
       }
       this.adminViewerLinks.delete(socketId);
